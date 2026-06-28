@@ -1,0 +1,92 @@
+name: Generate Cinematic Animation Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Story prompt"
+        required: true
+        type: string
+
+      video_type:
+        description: "Video size"
+        required: true
+        default: "short"
+        type: choice
+        options:
+          - short
+          - medium
+          - long
+
+      languages:
+        description: "Languages (e.g., Telugu, English)"
+        required: true
+        default: "Telugu"
+
+      aspect_ratio:
+        description: "Aspect Ratio"
+        required: true
+        default: "9:16"
+        type: choice
+        options:
+          - "9:16"
+          - "16:9"
+          - "1:1"
+
+      background_music:
+        description: "Optional path to background music inside repo (e.g., background.mp3). Leave empty to skip."
+        required: false
+        type: string
+
+jobs:
+  generate-video:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 180
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install openai pillow requests moviepy numpy
+
+      - name: Create Output Folders
+        run: |
+          mkdir -p output
+          mkdir -p output/_shared
+          mkdir -p output/_temp
+
+      - name: Generate Cinematic Video
+
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+        run: |
+          python generate_animation_video.py \
+            --prompt "${{ github.event.inputs.prompt }}" \
+            --video-type "${{ github.event.inputs.video_type }}" \
+            --languages "${{ github.event.inputs.languages }}" \
+            --style "Pixar style cinematic 3D animated movie, expressive cartoon characters, emotional facial expressions, dynamic movement, DreamWorks quality, cinematic lighting, ultra detailed animation" \
+            --aspect-ratio "${{ github.event.inputs.aspect_ratio }}" \
+            $(if [ -n "${{ github.event.inputs.background_music }}" ]; then echo "--background-music \"${{ github.event.inputs.background_music }}\""; fi)
+
+      - name: Upload Videos
+        uses: actions/upload-artifact@v4
+        with:
+          name: cinematic-animation-video
+          path: output/
