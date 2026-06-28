@@ -186,17 +186,65 @@ def create_fallback_image(text_prompt, out_path: Path, width: int, height: int):
     img.save(out_path)
 
 
-def generate_animation_frames(client, base_prompt, scene_dir: Path, width: int, height: int):
-    prompts = [
-        f"{base_prompt}, first frame, character starting movement",
-        f"{base_prompt}, middle frame, character moving dynamically",
-        f"{base_prompt}, final frame, emotional cinematic pose",
-    ]
+def generate_animation_frames(
+    client,
+    base_prompt: str,
+    scene: dict,
+    scene_dir: Path,
+    width: int,
+    height: int,
+    frame_count: int = 18,
+):
+    """
+    Generate a sequence of frames for a scene. Prompts include explicit
+    instructions to keep the character visually consistent and describe
+    incremental pose changes for each frame.
+
+    Produces files named frame_000.png .. frame_{frame_count-1:03}.png
+    """
+    # Build a compact character description to insist on consistency
+    char_desc_parts = []
+    if scene.get("characters"):
+        # If storyboard includes characters list, use first character appearance as reference
+        first_char = scene.get("characters")[0] if isinstance(scene.get("characters"), list) and scene.get("characters") else {}
+        if isinstance(first_char, dict):
+            if first_char.get("name"):
+                char_desc_parts.append(f"character name {first_char.get('name')}")
+            if first_char.get("appearance"):
+                char_desc_parts.append(first_char.get("appearance"))
+    # fallback: use character_action or scene title
+    if scene.get("character_action"):
+        char_desc_parts.append(scene.get("character_action"))
+    if scene.get("title"):
+        char_desc_parts.append(scene.get("title"))
+
+    char_desc = ". ".join([p for p in char_desc_parts if p]).strip()
+    if not char_desc:
+        char_desc = "main character with consistent appearance across frames"
 
     frame_paths = []
 
-    for idx, prompt in enumerate(prompts):
-        frame_path = scene_dir / f"frame_{idx:02}.png"
+    for i in range(frame_count):
+        pct = int((i / max(1, frame_count - 1)) * 100)
+        motion_hint = (
+            f"Progress {pct}%. "
+            f"{'Start pose' if i == 0 else 'End pose' if i == frame_count - 1 else 'In-between pose'}."
+        )
+
+        # Compose an explicit prompt that asks for visual consistency and small pose deltas
+        prompt = (
+            f"{base_prompt}. {motion_hint} "
+            f"Maintain the same character appearance across all frames: {char_desc}. "
+            f"Describe small incremental changes from the previous frame (arms, head tilt, steps) to create smooth motion. "
+            f"Show natural limb movement, expressive face, and cinematic lighting. "
+            f"Animated 3D movie style — consistent colors, proportions, and costume. "
+            f"Do not change hairstyle, clothing, or proportions between frames. "
+            f"Avoid changing character identity or introducing new props."
+        )
+
+        frame_path = scene_dir / f"frame_{i:03}.png"
+
+        # Generate the image (or fallback) and save
         generate_image_with_openai(client, prompt, frame_path, width, height)
         frame_paths.append(frame_path)
 
@@ -291,30 +339,34 @@ def mix_with_background(narration_path: Path, background_path: Path, out_path: P
 def create_scene_video(frame_paths: List[Path], audio_path: Path, out_path: Path, width: int, height: int, fade_duration: float = 0.5):
     """
     Create a cinematic scene video from frames and narration audio.
-    Adds zoompan and minterpolate for smoother motion. Applies fade in/out.
-    Returns the duration (seconds) of the scene (audio).
+    Uses input framerate based on number of frames and audio duration,
+    then applies motion interpolation (minterpolate) to make motion smooth.
     """
     duration = get_audio_duration(audio_path)
 
+    if not frame_paths:
+        raise RuntimeError("No frames found for scene")
+
     temp_video = TEMP_DIR / f"{out_path.stem}_temp.mp4"
 
-    # pattern expects frame_00.png, frame_01.png, frame_02.png
-    input_pattern = str(frame_paths[0]).replace("00", "%02d")
+    # pattern expects frame_000.png, frame_001.png, ...
+    input_pattern = str(frame_paths[0]).replace("000", "%03d")
+
+    # calculate input fps so the sequence of frames spans the audio duration
+    fps_input = max(0.1, len(frame_paths) / max(0.1, duration))
 
     cmd = [
         "ffmpeg",
         "-y",
         "-framerate",
-        "1",
+        str(fps_input),
         "-i",
         input_pattern,
         "-vf",
         (
-            f"fps=30,"
-            f"scale={width}:{height},"
-            f"zoompan=z='min(zoom+0.0015,1.15)':"
-            f"d=125:s={width}x{height},"
-            f"minterpolate='fps=30'"
+            f"fps=30,scale={width}:{height},"
+            # Motion-compensated interpolation for smoother motion (output ~60fps)
+            f"minterpolate='mi_mode=mci:mc_mode=obmc:vsbmc=1:fps=60'"
         ),
         "-t",
         str(duration),
@@ -364,10 +416,8 @@ def create_scene_video(frame_paths: List[Path], audio_path: Path, out_path: Path
 
     run_cmd(cmd3)
 
-    # move faded to final out_path
     shutil.move(str(faded), str(out_path))
 
-    # clean up temps (keep temp_video if needed)
     for p in [temp_video, merged_video]:
         try:
             p.unlink()
@@ -431,7 +481,18 @@ def write_srt(scenes: List[dict], audio_files: List[Path], out_srt: Path):
             current = end
 
 
-def build_shared_images(client, scenes, width, height, style):
+def build_shared_images(client, scenes, width, height, style, video_type: str = "short"):
+    """
+    Build per-scene image sequences. Chooses frame_count based on video_type.
+    """
+    # decide frame_count per scene based on video type for smoother motion
+    if video_type == "short":
+        frame_count = 14
+    elif video_type == "medium":
+        frame_count = 20
+    else:
+        frame_count = 28
+
     for idx, scene in enumerate(scenes, start=1):
         scene_dir = IMAGES_DIR / f"scene_{idx:02}"
         scene_dir.mkdir(parents=True, exist_ok=True)
@@ -446,7 +507,17 @@ def build_shared_images(client, scenes, width, height, style):
             f"Expressive cartoon characters. "
             f"Dynamic movement pose."
         )
-        generate_animation_frames(client, prompt, scene_dir, width, height)
+
+        # Generate an animated sequence of frames for this scene
+        generate_animation_frames(
+            client,
+            prompt,
+            scene,
+            scene_dir,
+            width,
+            height,
+            frame_count=frame_count,
+        )
 
 
 def main():
@@ -460,6 +531,9 @@ def main():
     parser.add_argument("--fade-duration", required=False, type=float, default=0.5, help="Fade in/out seconds for each scene.")
     args = parser.parse_args()
 
+    if not os.getenv("OPENAI_API_KEY"):
+        raise SystemExit("Missing OPENAI_API_KEY environment variable. Add it to your repo Secrets or set it locally before running.")
+
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
     ensure_dirs()
@@ -468,8 +542,8 @@ def main():
 
     storyboard = create_master_storyboard(client, args.prompt, args.video_type, args.style)
 
-    # Build shared frames
-    build_shared_images(client, storyboard["scenes"], width, height, args.style)
+    # Build shared frames (more frames per scene for smoother movement)
+    build_shared_images(client, storyboard["scenes"], width, height, args.style, video_type=args.video_type)
 
     scene_videos = []
     scene_audio_files = []
@@ -488,11 +562,11 @@ def main():
 
     for idx, scene in enumerate(storyboard["scenes"], start=1):
         scene_dir = IMAGES_DIR / f"scene_{idx:02}"
+        # Will match frame_000.png .. frame_00N.png
         frame_paths = sorted(scene_dir.glob("frame_*.png"))
 
         audio_file = TEMP_DIR / f"scene_{idx:02}.mp3"
         audio_file_mixed = TEMP_DIR / f"scene_{idx:02}_mixed.mp3"
-        video_file = TEMP_DIR / f"scene_{idx:02}.mp4"
         processed_video = TEMP_DIR / f"scene_{idx:02}_processed.mp4"
 
         # pick narration
@@ -524,8 +598,8 @@ def main():
         else:
             audio_to_use = audio_file
 
-        # create scene video (with fades)
-        print(f"Creating scene video for scene {idx}...")
+        # create scene video (with frame pacing and motion interpolation)
+        print(f"Creating scene video for scene {idx} with {len(frame_paths)} frames...")
         duration = create_scene_video(frame_paths, audio_to_use, processed_video, width, height, fade_duration=args.fade_duration)
 
         # move processed to a stable video file list for concatenation
